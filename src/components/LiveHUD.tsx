@@ -4,16 +4,57 @@
  * Real-time Heads-Up Display for golf swing analysis.
  *
  * Key subsystems implemented here:
- *  1. OneEuroFilter  – adaptive low-pass filter (Casiez et al. 2012).
- *                      Kills jitter when the signal is slow while staying
- *                      responsive during fast movements.
+ *  1. OneEuroFilter       – adaptive low-pass filter (Casiez et al. 2012).
+ *                           Kills jitter when the signal is slow while staying
+ *                           responsive during fast movements.
  *  2. Depth-Normalised Angle – corrects for MediaPipe's z-scale ambiguity
- *                      so Shoulder Turn accuracy is preserved regardless of
- *                      the golfer's distance from the camera.
- *  3. LiveHUD component – overlays computed swing metrics on the video feed.
+ *                           so Shoulder Turn accuracy is preserved regardless
+ *                           of the golfer's distance from the camera.
+ *  3. Supabase sync       – optional cloud recording that degrades gracefully
+ *                           to offline mode when API keys are absent or the
+ *                           package is not installed.
+ *  4. Handedness mirror   – flips landmark x-coordinates for front-facing
+ *                           cameras so the skeleton overlay aligns with the
+ *                           horizontally-flipped video stream.
+ *  5. LiveHUD component   – overlays computed swing metrics on the video feed,
+ *                           with Record / Set Address / Clear controls and a
+ *                           toggleable Drawing Toolbar.
  */
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+
+// ─── Supabase – offline-safe duck-typed client ────────────────────────────────
+
+/** Minimal interface we actually use from @supabase/supabase-js. */
+type SupabaseLike = {
+  from(table: string): {
+    insert(rows: object): Promise<{ error: { message: string } | null }>;
+  };
+};
+
+/**
+ * Attempts to create a Supabase client from the supplied credentials.
+ * Returns `null` (offline mode) in any of these cases:
+ *   • `url` or `key` are absent / undefined
+ *   • `@supabase/supabase-js` is not installed in the project
+ *   • `createClient` throws for any other reason
+ *
+ * The rest of the component treats `null` as "offline mode" and continues
+ * to operate normally – recorded frames are buffered in memory only.
+ */
+function tryCreateClient(url?: string, key?: string): SupabaseLike | null {
+  if (!url || !key) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createClient } = require("@supabase/supabase-js") as {
+      createClient: (u: string, k: string) => SupabaseLike;
+    };
+    return createClient(url, key);
+  } catch {
+    console.warn("[LiveHUD] Supabase init failed – running in offline mode.");
+    return null;
+  }
+}
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -64,6 +105,30 @@ export interface LiveHUDProps {
   className?: string;
   /** Called every frame with the latest computed metrics. */
   onMetrics?: (metrics: SwingMetrics) => void;
+  /**
+   * Set `true` for front-facing / selfie cameras.
+   *
+   * When enabled, landmark x-coordinates are mirrored (x → 1 − x) before
+   * metric computation so the skeleton overlay aligns with the horizontally-
+   * flipped video feed. The parent should also apply `scaleX(-1)` to any
+   * canvas element that draws the raw skeleton points, e.g.:
+   *
+   * ```tsx
+   * <canvas style={isFrontCamera ? { transform: "scaleX(-1)" } : undefined} />
+   * ```
+   */
+  isFrontCamera?: boolean;
+  /**
+   * Supabase project URL (e.g. `https://xxxx.supabase.co`).
+   * Omit to run in offline mode – the component functions normally but
+   * recorded sessions are buffered in memory only.
+   */
+  supabaseUrl?: string;
+  /**
+   * Supabase anon / public API key.
+   * Omit to run in offline mode.
+   */
+  supabaseKey?: string;
 }
 
 // ─── MediaPipe landmark indices ───────────────────────────────────────────────
@@ -293,7 +358,17 @@ function computeMetrics(
   };
 }
 
-// ─── 4. HUD UI components ─────────────────────────────────────────────────────
+// ─── Drawing tools definition ─────────────────────────────────────────────────
+
+const DRAWING_TOOLS = [
+  { name: "Pen", icon: "✏" },
+  { name: "Line", icon: "╱" },
+  { name: "Angle", icon: "∠" },
+  { name: "Circle", icon: "○" },
+  { name: "Erase", icon: "⌫" },
+] as const;
+
+// ─── 4. HUD UI sub-components ─────────────────────────────────────────────────
 
 interface GaugeProps {
   label: string;
@@ -375,6 +450,164 @@ const Gauge: React.FC<GaugeProps> = ({
   );
 };
 
+/**
+ * Down-arrow icon button (top-right of the header) that toggles the drawing
+ * toolbar. The chevron rotates 180° when the toolbar is open.
+ */
+const DrawingToggleButton: React.FC<{
+  open: boolean;
+  onClick: () => void;
+}> = ({ open, onClick }) => (
+  <button
+    onClick={onClick}
+    style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      width: 20,
+      height: 20,
+      padding: 0,
+      background: open
+        ? "rgba(192, 132, 252, 0.15)"
+        : "rgba(255,255,255,0.05)",
+      border: `1px solid ${open ? "rgba(192,132,252,0.4)" : "rgba(255,255,255,0.1)"}`,
+      borderRadius: 4,
+      cursor: "pointer",
+      color: open ? "#c084fc" : "#4a5568",
+      flexShrink: 0,
+      pointerEvents: "auto",
+      transition: "background 150ms, border-color 150ms, color 150ms",
+    }}
+    aria-label={open ? "Close drawing toolbar" : "Open drawing toolbar"}
+    title="Drawing Tools"
+  >
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{
+        transform: open ? "rotate(180deg)" : "rotate(0deg)",
+        transition: "transform 200ms",
+      }}
+    >
+      <polyline points="6 9 12 15 18 9" />
+    </svg>
+  </button>
+);
+
+/** Placeholder drawing toolbar revealed when the toggle is active. */
+const DrawingToolbarPanel: React.FC = () => (
+  <div
+    style={{
+      marginBottom: 10,
+      padding: "8px 10px",
+      background: "rgba(255,255,255,0.04)",
+      border: "1px solid rgba(255,255,255,0.07)",
+      borderRadius: 8,
+    }}
+  >
+    <span
+      style={{
+        display: "block",
+        marginBottom: 6,
+        fontSize: 9,
+        color: "#8a9ab5",
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
+      }}
+    >
+      Drawing Tools
+    </span>
+    <div style={{ display: "flex", gap: 4, pointerEvents: "auto" }}>
+      {DRAWING_TOOLS.map((tool) => (
+        <button
+          key={tool.name}
+          title={tool.name}
+          style={{
+            flex: 1,
+            padding: "5px 0",
+            fontSize: 13,
+            background: "rgba(255,255,255,0.05)",
+            border: "1px solid rgba(255,255,255,0.09)",
+            borderRadius: 6,
+            color: "#8a9ab5",
+            cursor: "pointer",
+            fontFamily: "inherit",
+            transition: "background 120ms, color 120ms",
+          }}
+        >
+          {tool.icon}
+        </button>
+      ))}
+    </div>
+  </div>
+);
+
+interface ActionBarProps {
+  isRecording: boolean;
+  hasAddress: boolean;
+  canSetAddress: boolean;
+  onRecord: () => void;
+  onSetAddress: () => void;
+  onClear: () => void;
+}
+
+/** Record / Set Address / Clear control row. */
+const ActionBar: React.FC<ActionBarProps> = ({
+  isRecording,
+  hasAddress,
+  canSetAddress,
+  onRecord,
+  onSetAddress,
+  onClear,
+}) => (
+  <div
+    style={{
+      marginTop: 8,
+      paddingTop: 8,
+      borderTop: "1px solid rgba(255,255,255,0.05)",
+      display: "flex",
+      gap: 5,
+      pointerEvents: "auto",
+    }}
+  >
+    {/* Record / Stop */}
+    <button
+      onClick={onRecord}
+      style={{
+        ...actionBtnBase,
+        ...(isRecording ? actionBtnRecordActive : {}),
+      }}
+    >
+      {isRecording ? "■ Stop" : "● Rec"}
+    </button>
+
+    {/* Set Address */}
+    <button
+      onClick={onSetAddress}
+      disabled={!canSetAddress}
+      style={{
+        ...actionBtnBase,
+        ...(hasAddress ? actionBtnAddrActive : {}),
+        opacity: canSetAddress ? 1 : 0.38,
+        cursor: canSetAddress ? "pointer" : "not-allowed",
+      }}
+    >
+      ⊙ Addr
+    </button>
+
+    {/* Clear */}
+    <button onClick={onClear} style={actionBtnBase}>
+      ✕ Clear
+    </button>
+  </div>
+);
+
 // ─── 5. LiveHUD ───────────────────────────────────────────────────────────────
 
 /**
@@ -384,7 +617,15 @@ const Gauge: React.FC<GaugeProps> = ({
  * ```tsx
  * <div style={{ position: "relative" }}>
  *   <video ref={videoRef} />
- *   <LiveHUD landmarks={poseLandmarks} onMetrics={handleMetrics} />
+ *   {/* Mirror the skeleton canvas for front cameras: *\/}
+ *   <canvas style={isFront ? { transform: "scaleX(-1)" } : undefined} />
+ *   <LiveHUD
+ *     landmarks={poseLandmarks}
+ *     isFrontCamera={isFront}
+ *     supabaseUrl={process.env.REACT_APP_SUPABASE_URL}
+ *     supabaseKey={process.env.REACT_APP_SUPABASE_ANON_KEY}
+ *     onMetrics={handleMetrics}
+ *   />
  * </div>
  * ```
  *
@@ -395,20 +636,186 @@ export const LiveHUD: React.FC<LiveHUDProps> = ({
   landmarks,
   className,
   onMetrics,
+  isFrontCamera = false,
+  supabaseUrl,
+  supabaseKey,
 }) => {
   const [metrics, setMetrics] = useState<SwingMetrics | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [addressLandmarks, setAddressLandmarks] = useState<PoseLandmark[] | null>(null);
+  const [drawingToolbarOpen, setDrawingToolbarOpen] = useState(false);
 
   // Each LiveHUD instance owns its own filter bank.
   const filtersRef = useRef<SwingFilters>(new SwingFilters());
 
+  // Supabase: initialised once synchronously to avoid an offline→online flash
+  // between the initial render and the first useEffect tick.
+  // Sentinel: undefined = not yet resolved; null = offline; object = connected.
+  const supaRef = useRef<SupabaseLike | null | undefined>(undefined);
+  if (supaRef.current === undefined) {
+    supaRef.current = tryCreateClient(supabaseUrl, supabaseKey);
+  }
+  const offlineMode = supaRef.current === null;
+
+  // In-memory frame buffer used while recording.
+  const recordedFramesRef = useRef<Array<{ ts: number; metrics: SwingMetrics }>>([]);
+  const sessionIdRef = useRef<string | null>(null);
+
+  // ── Metrics computation (runs on every incoming landmarks frame) ───────────
   useEffect(() => {
     // Need a full 33-landmark array; bail early on partial / missing data.
     if (!landmarks || landmarks.length < 33) return;
 
-    const m = computeMetrics(landmarks, filtersRef.current, performance.now());
+    // ── Handedness mirror ────────────────────────────────────────────────────
+    // Front-facing cameras produce a horizontally-flipped video feed.
+    // Mirroring x-coordinates here keeps skeleton metrics in the same display
+    // space as the video, preserving anatomically correct left/right from the
+    // viewer's perspective.  The parent is responsible for applying
+    // `transform: scaleX(-1)` to any canvas that renders the raw skeleton.
+    const lms: PoseLandmark[] = isFrontCamera
+      ? landmarks.map((lm) => ({ ...lm, x: 1 - lm.x }))
+      : landmarks;
+
+    const m = computeMetrics(lms, filtersRef.current, performance.now());
     setMetrics(m);
     onMetrics?.(m);
-  }, [landmarks, onMetrics]);
+
+    if (isRecording) {
+      recordedFramesRef.current.push({ ts: performance.now(), metrics: m });
+    }
+  }, [landmarks, isFrontCamera, onMetrics, isRecording]);
+
+  // ── Record handler ─────────────────────────────────────────────────────────
+  const handleRecord = useCallback(() => {
+    if (isRecording) {
+      setIsRecording(false);
+      const frames = recordedFramesRef.current;
+
+      // Flush to Supabase when available; silently retain frames in memory
+      // (offline mode) so callers can drain them via a custom onMetrics handler.
+      if (!offlineMode && supaRef.current && frames.length > 0) {
+        supaRef.current
+          .from("swing_sessions")
+          .insert({
+            session_id: sessionIdRef.current,
+            recorded_at: new Date().toISOString(),
+            frames,
+          })
+          .then(({ error }) => {
+            if (error) {
+              console.error("[LiveHUD] Supabase write error:", error.message);
+            }
+          });
+      }
+
+      recordedFramesRef.current = [];
+      sessionIdRef.current = null;
+    } else {
+      setIsRecording(true);
+      sessionIdRef.current = `session_${Date.now()}`;
+      recordedFramesRef.current = [];
+    }
+  }, [isRecording, offlineMode]);
+
+  // ── Set Address handler ────────────────────────────────────────────────────
+  // Captures the current landmark set as the golfer's address (setup) position.
+  // Mirrors x-coords consistent with isFrontCamera so stored coordinates match
+  // the metrics coordinate space.
+  const handleSetAddress = useCallback(() => {
+    if (!landmarks || landmarks.length < 33) return;
+    const lms: PoseLandmark[] = isFrontCamera
+      ? landmarks.map((lm) => ({ ...lm, x: 1 - lm.x }))
+      : landmarks;
+    setAddressLandmarks(lms);
+  }, [landmarks, isFrontCamera]);
+
+  // ── Clear handler ──────────────────────────────────────────────────────────
+  const handleClear = useCallback(() => {
+    setAddressLandmarks(null);
+    setIsRecording(false);
+    recordedFramesRef.current = [];
+    sessionIdRef.current = null;
+    filtersRef.current.reset();
+    setMetrics(null);
+  }, []);
+
+  // ── Shared header ──────────────────────────────────────────────────────────
+  const confidence = metrics?.confidence ?? 0;
+
+  const header = (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        marginBottom: 12,
+        gap: 8,
+      }}
+    >
+      <StatusDot confidence={confidence} />
+      <span
+        style={{
+          fontSize: 10,
+          color: "#8a9ab5",
+          textTransform: "uppercase",
+          letterSpacing: "0.1em",
+        }}
+      >
+        {metrics ? "Swing Analysis" : "Awaiting pose…"}
+      </span>
+      {/* Confidence % + drawing-toolbar toggle, grouped on the right */}
+      <div
+        style={{
+          marginLeft: "auto",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+      >
+        {metrics && (
+          <span style={{ fontSize: 10, color: "#4a5568" }}>
+            {(confidence * 100).toFixed(0)}%
+          </span>
+        )}
+        <DrawingToggleButton
+          open={drawingToolbarOpen}
+          onClick={() => setDrawingToolbarOpen((o) => !o)}
+        />
+      </div>
+    </div>
+  );
+
+  // ── Shared footer badges ───────────────────────────────────────────────────
+  const footer = (
+    <div
+      style={{
+        marginTop: 10,
+        paddingTop: 8,
+        borderTop: "1px solid rgba(255,255,255,0.05)",
+        display: "flex",
+        gap: 6,
+        flexWrap: "wrap",
+      }}
+    >
+      <Badge>1€ Filter</Badge>
+      <Badge>Depth Norm</Badge>
+      {isFrontCamera && <Badge>Mirror</Badge>}
+      {offlineMode && (
+        <Badge style={{ color: "#fbbf24", borderColor: "rgba(251,191,36,0.2)" }}>
+          Offline
+        </Badge>
+      )}
+      {isRecording && (
+        <Badge style={{ color: "#f87171", borderColor: "rgba(248,113,113,0.2)" }}>
+          ● REC
+        </Badge>
+      )}
+      {addressLandmarks && (
+        <Badge style={{ color: "#34d399", borderColor: "rgba(52,211,153,0.2)" }}>
+          Addr Set
+        </Badge>
+      )}
+    </div>
+  );
 
   // ── No-pose state ──────────────────────────────────────────────────────────
   if (!metrics) {
@@ -418,23 +825,23 @@ export const LiveHUD: React.FC<LiveHUDProps> = ({
         style={rootStyle}
         aria-label="Swing HUD – awaiting pose"
       >
-        <StatusDot confidence={0} />
-        <span style={{ fontSize: 11, color: "#4a5568", marginLeft: 8 }}>
-          Awaiting pose…
-        </span>
+        {header}
+        {drawingToolbarOpen && <DrawingToolbarPanel />}
+        {footer}
+        <ActionBar
+          isRecording={isRecording}
+          hasAddress={!!addressLandmarks}
+          canSetAddress={false}
+          onRecord={handleRecord}
+          onSetAddress={handleSetAddress}
+          onClear={handleClear}
+        />
       </div>
     );
   }
 
-  const {
-    shoulderTurn,
-    shoulderTurnRaw,
-    hipTurn,
-    hipTurnRaw,
-    xFactor,
-    spineAngle,
-    confidence,
-  } = metrics;
+  const { shoulderTurn, shoulderTurnRaw, hipTurn, hipTurnRaw, xFactor, spineAngle } =
+    metrics;
 
   return (
     <div
@@ -443,29 +850,10 @@ export const LiveHUD: React.FC<LiveHUDProps> = ({
       aria-label="Live Swing Analysis HUD"
     >
       {/* ── Header ────────────────────────────────────────────────────── */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          marginBottom: 12,
-          gap: 8,
-        }}
-      >
-        <StatusDot confidence={confidence} />
-        <span
-          style={{
-            fontSize: 10,
-            color: "#8a9ab5",
-            textTransform: "uppercase",
-            letterSpacing: "0.1em",
-          }}
-        >
-          Swing Analysis
-        </span>
-        <span style={{ marginLeft: "auto", fontSize: 10, color: "#4a5568" }}>
-          {(confidence * 100).toFixed(0)}%
-        </span>
-      </div>
+      {header}
+
+      {/* ── Drawing Toolbar (placeholder) ─────────────────────────────── */}
+      {drawingToolbarOpen && <DrawingToolbarPanel />}
 
       {/* ── Gauges ────────────────────────────────────────────────────── */}
       <Gauge
@@ -504,18 +892,17 @@ export const LiveHUD: React.FC<LiveHUDProps> = ({
       />
 
       {/* ── Footer badges ─────────────────────────────────────────────── */}
-      <div
-        style={{
-          marginTop: 10,
-          paddingTop: 8,
-          borderTop: "1px solid rgba(255,255,255,0.05)",
-          display: "flex",
-          gap: 6,
-        }}
-      >
-        <Badge>1€ Filter</Badge>
-        <Badge>Depth Norm</Badge>
-      </div>
+      {footer}
+
+      {/* ── Action Buttons ────────────────────────────────────────────── */}
+      <ActionBar
+        isRecording={isRecording}
+        hasAddress={!!addressLandmarks}
+        canSetAddress={true}
+        onRecord={handleRecord}
+        onSetAddress={handleSetAddress}
+        onClear={handleClear}
+      />
     </div>
   );
 };
@@ -539,7 +926,10 @@ const StatusDot: React.FC<{ confidence: number }> = ({ confidence }) => {
   );
 };
 
-const Badge: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+const Badge: React.FC<{
+  children: React.ReactNode;
+  style?: React.CSSProperties;
+}> = ({ children, style }) => (
   <span
     style={{
       fontSize: 8,
@@ -549,6 +939,7 @@ const Badge: React.FC<{ children: React.ReactNode }> = ({ children }) => (
       padding: "1px 5px",
       textTransform: "uppercase",
       letterSpacing: "0.06em",
+      ...style,
     }}
   >
     {children}
@@ -557,6 +948,13 @@ const Badge: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
 
+/**
+ * Root HUD container.
+ *
+ * `pointerEvents: "none"` lets clicks pass through to the underlying video.
+ * Interactive children (buttons) set `pointerEvents: "auto"` locally so they
+ * remain fully clickable despite the parent override.
+ */
 const rootStyle: React.CSSProperties = {
   position: "absolute",
   top: 14,
@@ -574,6 +972,34 @@ const rootStyle: React.CSSProperties = {
   pointerEvents: "none",
   display: "flex",
   flexDirection: "column",
+};
+
+const actionBtnBase: React.CSSProperties = {
+  flex: 1,
+  padding: "4px 0",
+  fontSize: 9,
+  fontFamily: "inherit",
+  fontWeight: 600,
+  letterSpacing: "0.04em",
+  textTransform: "uppercase",
+  border: "1px solid rgba(255,255,255,0.1)",
+  borderRadius: 6,
+  background: "rgba(255,255,255,0.05)",
+  color: "#8a9ab5",
+  cursor: "pointer",
+  transition: "background 150ms, color 150ms, border-color 150ms",
+};
+
+const actionBtnRecordActive: React.CSSProperties = {
+  background: "rgba(248, 113, 113, 0.15)",
+  borderColor: "rgba(248, 113, 113, 0.4)",
+  color: "#f87171",
+};
+
+const actionBtnAddrActive: React.CSSProperties = {
+  background: "rgba(52, 211, 153, 0.15)",
+  borderColor: "rgba(52, 211, 153, 0.4)",
+  color: "#34d399",
 };
 
 export default LiveHUD;
